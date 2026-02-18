@@ -1504,46 +1504,105 @@ def _escape_html(text: str) -> str:
 
 def _strip_leading_heading(html: str, tag_name: str) -> str:
     """Remove leading heading tags from the HTML content to avoid duplication
-    with the normalized <h2> we insert."""
-    if not tag_name or tag_name == "toc":
-        # For TOC-derived chapters, strip all leading heading-like elements
-        # (h-tags and known heading divs like ct, cst, cpt, cct, ctag1)
-        stripped = html
-        for _ in range(8):
-            m = re.match(
-                r"\s*<(h[1-6])\b[^>]*>.*?</\1>",
-                stripped,
-                re.DOTALL | re.IGNORECASE,
-            )
-            if m:
-                stripped = stripped[m.end():]
-                continue
-            m = re.match(
-                r'\s*<(div|p)\s+class="(ct|cst|cpt|cct|ctag1)[^"]*"[^>]*>.*?</\1>',
-                stripped,
-                re.DOTALL | re.IGNORECASE,
-            )
-            if m:
-                stripped = stripped[m.end():]
-                continue
-            break
-        return stripped
+    with the normalized <h2> we insert.
 
-    # For heading-tag splits, strip the specific heading and its subtitle
-    pattern = re.compile(
-        rf"^\s*<{re.escape(tag_name)}[^>]*>.*?</{re.escape(tag_name)}>",
-        re.DOTALL | re.IGNORECASE,
-    )
-    result = pattern.sub("", html, count=1)
-    # Also strip a subtitle heading (one level lower) if it immediately follows
-    h_level = int(tag_name[1])
-    subtitle_tag = f"h{h_level + 1}"
-    subtitle_pattern = re.compile(
-        rf"^\s*<{re.escape(subtitle_tag)}[^>]*>.*?</{re.escape(subtitle_tag)}>",
-        re.DOTALL | re.IGNORECASE,
-    )
-    result = subtitle_pattern.sub("", result, count=1)
-    return result
+    Uses BeautifulSoup so it works regardless of whether headings are bare,
+    wrapped in <div>/<section> containers, or interspersed with anchors.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    body = soup.find("body") or soup
+
+    if not tag_name or tag_name == "toc":
+        # TOC-derived: strip all leading heading-like elements until we hit
+        # real body content (a <p>, <blockquote>, <table>, <ul>, <ol>, etc.).
+        heading_tags = {"h1", "h2", "h3", "h4", "h5", "h6"}
+        heading_classes = {"ct", "cst", "cpt", "cct", "ctag1"}
+        to_remove = _collect_leading_headings(body, heading_tags, heading_classes)
+        for el in to_remove:
+            # If the heading's parent is a div/section that becomes empty
+            # after removal, remove the parent too.
+            parent = el.parent
+            el.decompose()
+            if (parent and parent is not body
+                    and parent.name in ("div", "section")
+                    and not parent.get_text(strip=True)):
+                parent.decompose()
+    else:
+        # Heading-tag split: strip the first occurrence of the specific tag,
+        # plus one subtitle heading (one level lower) if it immediately follows.
+        h = body.find(tag_name)
+        if h:
+            parent = h.parent
+            h.decompose()
+            if (parent and parent is not body
+                    and parent.name in ("div", "section")
+                    and not parent.get_text(strip=True)):
+                parent.decompose()
+
+        h_level = int(tag_name[1])
+        subtitle_tag = f"h{h_level + 1}"
+        sub = body.find(subtitle_tag)
+        if sub:
+            parent = sub.parent
+            sub.decompose()
+            if (parent and parent is not body
+                    and parent.name in ("div", "section")
+                    and not parent.get_text(strip=True)):
+                parent.decompose()
+
+    # Return the inner HTML of the body (not the <html>/<body> wrappers
+    # that BeautifulSoup adds).
+    return "".join(str(c) for c in body.children)
+
+
+def _collect_leading_headings(body, heading_tags: set, heading_classes: set) -> list:
+    """Walk body children and collect heading elements that appear before
+    any real body content.  Descends into div/section wrappers."""
+    to_remove = []
+
+    for child in list(body.children):
+        if isinstance(child, NavigableString):
+            if child.strip():
+                break  # non-whitespace text → real content
+            continue
+
+        name = getattr(child, "name", None)
+        if not name:
+            continue
+
+        # A heading tag itself
+        if name in heading_tags:
+            to_remove.append(child)
+            continue
+
+        # A div/p with a known heading class
+        cls = " ".join(child.get("class", []))
+        if name in ("div", "p") and any(c in heading_classes for c in child.get("class", [])):
+            to_remove.append(child)
+            continue
+
+        # A div/section wrapper: check if it contains only heading elements
+        # (heading tags, anchors, whitespace).  If so, treat it as a heading
+        # block.  If it also has body content, just strip headings inside it.
+        if name in ("div", "section"):
+            inner_headings = child.find_all(heading_tags)
+            inner_text = child.get_text(strip=True)
+            heading_text = " ".join(h.get_text(strip=True) for h in inner_headings)
+            # If all text in the div comes from headings, strip the whole div
+            if inner_headings and inner_text == heading_text:
+                to_remove.append(child)
+                continue
+            # If the div has headings AND body content, strip only the headings
+            # inside it (the first batch) and stop.
+            if inner_headings:
+                for h in inner_headings:
+                    to_remove.append(h)
+                break  # stop — the rest of this div is body content
+
+        # Any other element (p, blockquote, table, etc.) → real content
+        break
+
+    return to_remove
 
 
 # ============================================================================
