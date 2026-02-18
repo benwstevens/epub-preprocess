@@ -1,6 +1,6 @@
 # EPUB Preprocessor — Fix Plan
 
-## Status: IN PROGRESS
+## Status: COMPLETE
 
 ---
 
@@ -131,12 +131,12 @@ Within those, some files contain multiple sub-chapters:
 ## 3. Implementation Steps
 
 - [x] Step 1: Read spec, current script, test on EPUB, diagnose bugs
-- [ ] Step 2: Add front/back matter detection; skip non-content files in analysis
-- [ ] Step 3: Fix heading promotion (add ct/cst, handle conflicts)
-- [ ] Step 4: Rewrite `build_chapter_candidates` to be TOC-driven
-- [ ] Step 5: Fix label building to use TOC hierarchy properly
-- [ ] Step 6: Test and verify output on `theoryofmoralsentiment.epub`
-- [ ] Step 7: Handle edge case: multi-chapter files (sub-splitting)
+- [x] Step 2: Add front/back matter detection; skip non-content files in analysis
+- [x] Step 3: Fix heading promotion (add ct/cst, handle conflicts)
+- [x] Step 4: Rewrite `build_chapter_candidates` to be TOC-driven
+- [x] Step 5: Fix label building to use TOC hierarchy properly
+- [x] Step 6: Test and verify output on `theoryofmoralsentiment.epub`
+- [x] Step 7: Handle edge case: multi-chapter files (sub-splitting)
 
 ---
 
@@ -152,4 +152,24 @@ Within those, some files contain multiple sub-chapters:
 ```
 
 ### After fixes
-*(to be filled in after implementation)*
+```
+54 chapters, 150,673 words
+- Correct parent hierarchy throughout (Part I Sec I, Part I Sec II, etc.)
+- No mega-chapters (largest is 12,959 words — legitimate long section)
+- No tiny or duplicate entries
+- Front/back matter correctly excluded (intro, notes, index, teaser)
+- Multi-chapter files (c01, c02, c04, c06, c18, c21, c22) correctly sub-split
+- Single-chapter files (c07-c16, c17, c19-c20, c23) kept as single entries
+- 0 warnings
+```
+
+### Key changes made
+1. `classify_spine_items()` — detects front/back/content files from TOC
+2. `skip_hrefs` filtering — excludes TOC page, front/back matter from heading analysis
+3. Added `ct` → h3 and `cst` → h4 to promotion map (fixes files with no native h-tags)
+4. `build_chapter_candidates()` completely rewritten:
+   - TOC-driven (walks TOC tree, maps entries to files)
+   - Per-file processing (no fragile HTML concatenation)
+   - Ancestor tracking from TOC tree (not from heading position)
+   - Sub-splitting via `_find_sub_chapter_tag()` and `_split_file_at_headings()`
+5. `_strip_leading_heading()` handles TOC-derived chapters and subtitle stripping
