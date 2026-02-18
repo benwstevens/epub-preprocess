@@ -763,6 +763,12 @@ def run_structural_audit(
         count = len(heading_data.get(split_tag, []))
         print(f"\n  Deepest split level: <{split_tag}> ({count} chapters)")
 
+    # Get book title for filtering
+    book_title = ""
+    titles = book.get_metadata("DC", "title")
+    if titles:
+        book_title = titles[0][0].strip()
+
     return {
         "toc_tree": toc_tree,
         "flat_toc": flat_toc,
@@ -776,6 +782,7 @@ def run_structural_audit(
         "hierarchy": hierarchy,
         "split_tag": split_tag,
         "epub_path": epub_path,
+        "book_title": book_title,
     }
 
 
@@ -904,6 +911,117 @@ def _split_file_at_headings(
     return chunks
 
 
+def _split_at_fragment(soup, body_html: str, fragment: str, next_fragment: str | None) -> str:
+    """Extract the portion of body_html between two fragment anchors.
+
+    Finds the element with id=fragment and returns content from that element
+    up to (but not including) the element with id=next_fragment.  If
+    next_fragment is None, returns everything from fragment to end.
+    """
+    body = soup.find("body")
+    if not body:
+        return body_html
+
+    start_el = soup.find(id=fragment)
+    if not start_el:
+        # Try finding by name attribute (older EPUB convention)
+        start_el = soup.find(attrs={"name": fragment})
+    if not start_el:
+        return body_html
+
+    end_el = None
+    if next_fragment:
+        end_el = soup.find(id=next_fragment)
+        if not end_el:
+            end_el = soup.find(attrs={"name": next_fragment})
+
+    # Collect all elements from start to end
+    # We need to work with the serialized HTML using string positions
+    start_str = str(start_el)
+    start_pos = body_html.find(start_str)
+    if start_pos < 0:
+        # Fallback: find by fragment id in raw HTML
+        id_pattern = f'id="{fragment}"'
+        start_pos = body_html.find(id_pattern)
+        if start_pos < 0:
+            id_pattern = f"id='{fragment}'"
+            start_pos = body_html.find(id_pattern)
+        if start_pos >= 0:
+            # Back up to the start of the tag
+            start_pos = body_html.rfind("<", 0, start_pos)
+
+    if start_pos < 0:
+        return body_html
+
+    if end_el is not None:
+        end_str = str(end_el)
+        end_pos = body_html.find(end_str, start_pos + 1)
+        if end_pos < 0:
+            id_pattern = f'id="{next_fragment}"'
+            end_pos = body_html.find(id_pattern, start_pos + 1)
+            if end_pos < 0:
+                id_pattern = f"id='{next_fragment}'"
+                end_pos = body_html.find(id_pattern, start_pos + 1)
+            if end_pos >= 0:
+                end_pos = body_html.rfind("<", 0, end_pos)
+        if end_pos > start_pos:
+            return body_html[start_pos:end_pos]
+
+    return body_html[start_pos:]
+
+
+def _detect_chapter_depth(flat_toc: list[TOCEntry], max_toc_depth: int) -> int:
+    """Detect the TOC depth that contains chapter-level entries.
+
+    Heuristic: look for the depth where entries whose titles start with
+    "CHAPTER" (or similar chapter markers) live.  If no explicit chapter
+    markers exist, look at the structure: if depth-0 has both part labels
+    AND chapter entries, depth-0 is the chapter level.  Only fall back to
+    max_toc_depth when nothing else works.
+
+    This fixes Leviathan, where chapters are at depth 0 alongside part
+    labels, while sub-topics (Memory, Dreams, etc.) are at depth 1.
+    """
+    if max_toc_depth == 0:
+        return 0
+
+    chapter_re = re.compile(
+        r"^(chapter|ch\.?\s)\b", re.IGNORECASE
+    )
+    part_re = re.compile(r"^part\b", re.IGNORECASE)
+
+    # Count chapter-titled entries at each depth
+    chapter_counts: dict[int, int] = {}
+    total_counts: dict[int, int] = {}
+    for e in flat_toc:
+        if not e.base_href:
+            continue
+        total_counts[e.depth] = total_counts.get(e.depth, 0) + 1
+        if chapter_re.match(e.title):
+            chapter_counts[e.depth] = chapter_counts.get(e.depth, 0) + 1
+
+    # If there's a depth with explicit "CHAPTER" entries, use it
+    if chapter_counts:
+        best_depth = max(chapter_counts, key=lambda d: chapter_counts[d])
+        if chapter_counts[best_depth] >= 3:
+            return best_depth
+
+    # No explicit chapter markers.  Check if depth-0 has a mix of parts
+    # and content entries (chapters without "CHAPTER" prefix).  If the
+    # majority at depth 0 are NOT parts, treat depth 0 as chapter level.
+    depth_0_entries = [e for e in flat_toc if e.depth == 0 and e.base_href]
+    if depth_0_entries:
+        part_count = sum(1 for e in depth_0_entries if part_re.match(e.title))
+        non_part = len(depth_0_entries) - part_count
+        # If most depth-0 entries are not parts, chapters live at depth 0
+        if non_part > part_count:
+            return 0
+
+    # Default: use max depth (works for books like Moral Sentiments where
+    # parts are at depth 0 and sections/chapters are at depth 1)
+    return max_toc_depth
+
+
 def build_chapter_candidates(
     audit: dict,
     split_level: str | None = None,
@@ -922,7 +1040,7 @@ def build_chapter_candidates(
     docs = audit["docs"]
     classification = audit.get("classification", {})
 
-    # Determine target TOC depth
+    # Determine target TOC depth using smart chapter-detection (Fix F7)
     toc_depths = {e.depth for e in flat_toc if e.base_href}
     max_toc_depth = max(toc_depths) if toc_depths else 0
 
@@ -934,7 +1052,7 @@ def build_chapter_candidates(
         target_depth = min(1, max_toc_depth)
         do_sub_split = False
     else:
-        target_depth = max_toc_depth
+        target_depth = _detect_chapter_depth(flat_toc, max_toc_depth)
 
     # Build ancestor map: id(entry) -> [ancestor title strings]
     entry_ancestors: dict[int, list[str]] = {}
@@ -967,27 +1085,62 @@ def build_chapter_candidates(
     leaf_entries.sort(key=lambda e: flat_order.get(id(e), 999))
 
     # Filter out front/back matter entries
-    back_matter_re = re.compile(
-        r"^(teaser|biographical|textual|notes|index|copyright|title\s*page|"
+    # Only exclude entries whose titles match known non-content patterns.
+    # Do NOT exclude based solely on spine position (classification), because
+    # legitimate content like "THE INTRODUCTION" or "A REVIEW, AND CONCLUSION"
+    # may appear before/after the Part/Chapter block in the spine.
+    non_content_re = re.compile(
+        r"(^(teaser|biographical|textual\s*notes|index|copyright|title\s*page|"
         r"colophon|acknowledgment|about\s*the|also\s*by|further\s*reading|"
-        r"bibliography|glossary|next)",
+        r"bibliography|glossary|next\s*read|landmarks|contents|cover|"
+        r"dedication|epigraph|frontispiece|half\s*title|imprint|"
+        r"other\s*books|publisher|legal)"
+        r"|license\b)",
         re.IGNORECASE,
     )
+    # Also filter entries that are just the book title (title pages)
+    book_title = audit.get("book_title", "").upper()
+
+    # Titles that indicate real content even if file is in front/back position
+    content_title_re = re.compile(
+        r"^(part|chapter|ch\.?\s|section|book|act|the\s+introduction"
+        r"|a\s+review|conclusion)\b",
+        re.IGNORECASE,
+    )
+
     content_entries = []
     for entry in leaf_entries:
-        if back_matter_re.search(entry.title):
+        if non_content_re.search(entry.title):
             continue
+        # Skip entries that match the book title exactly (title pages)
+        if book_title and entry.title.strip().upper() == book_title:
+            continue
+        # Skip pure-number entries like "1651" (date/edition markers)
+        if re.match(r"^\d{4}$", entry.title.strip()):
+            continue
+        # Use file classification as a tiebreaker: if the file is classified
+        # as front/back matter AND the entry title doesn't look like real
+        # content (Part, Chapter, etc.), skip it.
         doc_href, _ = _get_doc_for_href(docs, entry.base_href)
         if doc_href and classification.get(doc_href) in ("front", "back"):
-            continue
+            if not content_title_re.match(entry.title):
+                continue
         content_entries.append(entry)
 
     if not content_entries:
         content_entries = leaf_entries
 
+    # Build a map of file -> ordered list of entries for fragment-aware splitting (Fix F8)
+    file_entries: dict[str, list[TOCEntry]] = {}
+    for entry in content_entries:
+        doc_href, _ = _get_doc_for_href(docs, entry.base_href)
+        if doc_href:
+            file_entries.setdefault(doc_href, []).append(entry)
+
     # Build candidates
     candidates = []
     chapter_idx = 0
+    processed_files: set[str] = set()
 
     for entry in content_entries:
         doc_href, doc_data = _get_doc_for_href(docs, entry.base_href)
@@ -1001,8 +1154,42 @@ def build_chapter_candidates(
             _abbreviate_label(a, _guess_role(a)) for a in ancestors
         ]
 
-        # Check for sub-chapters in this file
-        sub_tag = _find_sub_chapter_tag(soup) if do_sub_split else None
+        # Fragment-aware content extraction (Fix F8):
+        # When multiple entries share the same file, split at fragment boundaries
+        entry_html = body_html
+        siblings = file_entries.get(doc_href, [])
+        if entry.fragment and len(siblings) > 1:
+            # Find the next sibling's fragment for boundary
+            entry_idx_in_file = next(
+                (i for i, e in enumerate(siblings) if id(e) == id(entry)), -1
+            )
+            next_fragment = None
+            if entry_idx_in_file >= 0 and entry_idx_in_file + 1 < len(siblings):
+                next_entry = siblings[entry_idx_in_file + 1]
+                if next_entry.fragment:
+                    next_fragment = next_entry.fragment
+            entry_html = _split_at_fragment(soup, body_html, entry.fragment, next_fragment)
+        elif not entry.fragment and len(siblings) > 1:
+            # First entry in a shared file with no fragment: take content up to
+            # the first sibling's fragment
+            entry_idx_in_file = next(
+                (i for i, e in enumerate(siblings) if id(e) == id(entry)), -1
+            )
+            if entry_idx_in_file == 0 and len(siblings) > 1 and siblings[1].fragment:
+                next_frag = siblings[1].fragment
+                end_el = soup.find(id=next_frag)
+                if not end_el:
+                    end_el = soup.find(attrs={"name": next_frag})
+                if end_el:
+                    end_str = str(end_el)
+                    end_pos = body_html.find(end_str)
+                    if end_pos > 0:
+                        entry_html = body_html[:end_pos]
+
+        # Check for sub-chapters in this file (only when file isn't fragment-split)
+        sub_tag = None
+        if do_sub_split and len(siblings) <= 1:
+            sub_tag = _find_sub_chapter_tag(soup)
 
         if sub_tag:
             chunks = _split_file_at_headings(soup, body_html, sub_tag)
@@ -1034,7 +1221,7 @@ def build_chapter_candidates(
                     toc_entry=entry,
                 ))
         else:
-            # Single chapter from this file
+            # Single chapter from this entry
             chapter_idx += 1
             parts = list(ancestor_labels)
             parts.append(_abbreviate_label(entry.title, _guess_role(entry.title)))
@@ -1044,7 +1231,7 @@ def build_chapter_candidates(
                 label=", ".join(parts),
                 hierarchy_parts=parts,
                 heading_tag="toc",
-                html_content=body_html,
+                html_content=entry_html,
                 source_file=doc_href or "",
                 toc_entry=entry,
             ))
