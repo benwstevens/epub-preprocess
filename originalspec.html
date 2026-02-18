@@ -1,0 +1,225 @@
+# EPUB Preprocessor / Troubleshooter — Spec
+
+## The Problem
+
+The book distiller pipeline assumes a flat list of chapters, each marked with the same heading tag. This works for simple books but breaks on texts with nested hierarchies (Part → Section → Chapter), inconsistent heading markup, or EPUB files whose internal HTML splits don't align with the logical structure. Symptoms include:
+
+- **Mega-chapters**: Multiple Parts/Sections get merged into a single 47,000-word chunk because the splitter only recognizes one heading level.
+- **Duplicate labels**: "CHAPTER I" appears seven times with no Part/Section context, making the output unidentifiable.
+- **Missing divisions**: Entire Parts are absent from the chapter list because the EPUB uses a different edition than expected, or Part title pages aren't recognized as boundaries.
+- **Front/back matter contamination**: Introductions, editorial essays, indices, and license text get included as "chapters."
+
+## Recommendation: Standalone Script
+
+**`epub_preprocessor.py`** — a separate script that runs before the distiller pipeline.
+
+### Why standalone, not integrated into shared.py:
+
+1. **Different job.** The preprocessor is diagnostic and structural; the distiller is about API processing. Mixing them violates single-responsibility and makes both harder to debug.
+2. **Interactive by nature.** The preprocessor needs to show you what it found, let you approve or override, and iterate. The distiller pipeline is batch/automated.
+3. **Independently useful.** You'll want to inspect any new EPUB before committing to a distill run — even just to decide whether to use that edition or find a different one (as with the Gutenberg vs. Penguin Moral Sentiments situation).
+4. **Clean handoff.** The preprocessor outputs a normalized HTML file that the existing pipeline consumes without any modifications to shared.py or pipeline.py.
+
+### Workflow
+
+```
+epub_preprocessor.py  →  normalized.html  →  existing pipeline (shared.py / pipeline.py)
+                                                (Stage 1 detects heading tag,
+                                                 Stage 2 splits, etc.)
+```
+
+---
+
+## What the Preprocessor Does
+
+### Phase 1: Structural Audit
+
+**Input:** An .epub file.
+
+**Actions:**
+
+1. **Extract and parse the TOC** (NCX `<navMap>` and/or EPUB3 NAV document). Build a tree of the book's intended structure with nesting depth. For example:
+
+```
+Part I: Of the Propriety of Action (depth 0)
+  Section I: Of the Sense of Propriety (depth 1)
+    Chapter I: Of Sympathy (depth 2)
+    Chapter II: Of the Pleasure of mutual Sympathy (depth 2)
+    ...
+  Section II: Of the degrees of the different passions... (depth 1)
+    Introduction (depth 2)
+    Chapter I: Of the passions which take their origin from the body (depth 2)
+    ...
+```
+
+2. **Count the XHTML content files** in the spine (reading order) and note which TOC entries map to which files.
+
+3. **Scan all heading tags** (h1–h6) across all content files. Build a frequency table:
+
+```
+<h1>: 7 occurrences  (likely Part headings)
+<h2>: 11 occurrences (likely Section headings)  
+<h3>: 42 occurrences (likely Chapter headings)
+<p class="ct">: 3 occurrences (non-standard heading markup)
+```
+
+4. **Cross-reference TOC entries against actual heading tags.** Flag any TOC entry that doesn't correspond to a recognized heading tag in the HTML — this catches cases where "headings" are just styled `<p>` tags or `<div>` elements.
+
+5. **Identify the hierarchy.** Determine how many levels exist and what tag corresponds to each level. Present this to the user:
+
+```
+Detected hierarchy:
+  Level 0 (Parts):    <h1>  — 7 entries
+  Level 1 (Sections): <h2>  — 11 entries  
+  Level 2 (Chapters): <h3>  — 42 entries
+  
+Deepest split level: <h3> (42 chapters)
+```
+
+### Phase 2: Interactive Selection
+
+**Display the proposed chapter list** with full hierarchical labels and word counts:
+
+```
+Proposed chapters (42 total):
+
+ 1. Part I, Sec I, Ch I — Of Sympathy (2,303 words)
+ 2. Part I, Sec I, Ch II — Of the Pleasure of mutual Sympathy (1,333 words)
+ ...
+27. Part II, Sec III, Ch III — Of the final cause of this Irregularity (2,998 words)
+28. Part III, Ch I — Of the Principle of Self-approbation (1,616 words)
+ ...
+42. Part VII, Sec III, Ch III — Of those systems which make sentiment... (10,257 words)
+```
+
+**Flag problems automatically:**
+
+- ⚠️ Any chapter exceeding a configurable word limit (default: 15,000 words) — likely a merge error.
+- ⚠️ Any chapter under a minimum threshold (default: 50 words) — likely a title page or empty divider.
+- ⚠️ Duplicate labels that would be ambiguous without hierarchy prefixes.
+- ⚠️ TOC entries with no corresponding heading in the HTML.
+
+**User actions at this point:**
+
+- **Approve** the proposed list as-is.
+- **Exclude** specific items by number (same interface as the current distiller: `1-3,40-42`).
+- **Change split level**: e.g., split at Section level instead of Chapter level for a coarser output.
+- **Manual override**: specify a custom heading tag or regex pattern to split on.
+
+### Phase 3: Normalize and Output
+
+**Generate a single, clean HTML file** where:
+
+1. **Every intended chapter starts with a consistent `<h2>` tag** (or whatever the distiller's Stage 1 expects).
+2. **Each heading has a unique, descriptive title** incorporating the hierarchy:
+   - Before: `<h3>CHAPTER I</h3>` (ambiguous, repeated 7 times)
+   - After: `<h2>Part I, Section I, Chapter I — Of Sympathy</h2>` (unique, descriptive)
+3. **Front matter, back matter, and excluded items are stripped.**
+4. **Part/Section title pages** (those near-empty divider pages) are either merged into the first chapter of that section or discarded, based on user preference.
+5. **Non-standard heading markup is normalized.** If the source uses `<p class="chapter-title">` instead of actual heading tags, these get converted to `<h2>`.
+
+**Output:** `{original_filename}_normalized.html` saved to the `source/` directory, ready for the existing pipeline.
+
+**Also output a manifest file** (`{original_filename}_manifest.json`) recording the decisions made, so the normalization is reproducible:
+
+```json
+{
+  "source_epub": "The_Theory_of_Moral_Sentiments.epub",
+  "edition_note": "Penguin Classics, 6th edition (1790)",
+  "split_level": "chapter",
+  "heading_levels": {"h1": "part", "h2": "section", "h3": "chapter"},
+  "excluded_items": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+  "total_chapters": 42,
+  "total_words": 189432,
+  "chapters": [
+    {"index": 1, "label": "Part I, Sec I, Ch I — Of Sympathy", "words": 2303},
+    ...
+  ]
+}
+```
+
+---
+
+## Edge Cases to Handle
+
+### 1. No TOC / broken TOC
+Some EPUBs (especially poorly converted ones) have missing or skeletal NCX files. Fallback: scan all content files in spine order, catalog all heading tags, and infer structure from heading levels alone.
+
+### 2. Single-file EPUBs
+Some EPUBs pack the entire book into one XHTML file. The preprocessor must split on heading tags within that file rather than relying on file boundaries.
+
+### 3. Multi-file chapters
+The opposite problem: a single logical chapter spans multiple XHTML files (common in Gutenberg EPUBs). The preprocessor should detect this via the TOC (multiple files mapping to the same TOC entry) and concatenate them.
+
+### 4. Mixed heading markup
+Some publishers use `<h2>` for Part titles in one file and `<h3>` for Part titles in another, or use CSS classes instead of semantic heading tags. The preprocessor should detect inconsistencies and flag them.
+
+### 5. Appendices, dissertations, and bonus content
+Smith's Moral Sentiments includes "Considerations Concerning the First Formation of Languages" as an appendix. The user should be able to include or exclude this easily. The preprocessor should identify likely non-primary content (anything after the last Part/Section structure ends) and flag it separately.
+
+### 6. Editions with different structures
+As we saw, the 1st edition has 6 Parts and the 6th edition has 7. The preprocessor should report what it finds without assuming a "correct" structure — the user decides.
+
+---
+
+## CLI Interface
+
+```bash
+# Basic usage — interactive mode
+python epub_preprocessor.py book.epub
+
+# Specify output location
+python epub_preprocessor.py book.epub --output source/
+
+# Non-interactive: accept defaults, exclude front matter by keyword
+python epub_preprocessor.py book.epub --auto --exclude-keywords "contents,landmarks,notes,index,copyright"
+
+# Override split level
+python epub_preprocessor.py book.epub --split-level section
+
+# Dry run — just show the audit, don't write anything
+python epub_preprocessor.py book.epub --audit-only
+
+# Use a previous manifest to re-run with same settings
+python epub_preprocessor.py book.epub --manifest previous_manifest.json
+```
+
+---
+
+## Dependencies
+
+```
+beautifulsoup4    # HTML parsing
+lxml              # XML/XHTML parsing  
+ebooklib          # EPUB reading (already in pipeline requirements)
+```
+
+No new dependencies beyond what the pipeline already uses.
+
+---
+
+## Integration with Existing Pipeline
+
+The preprocessor is a **zero-change integration** with the current pipeline:
+
+1. Run `epub_preprocessor.py` on your EPUB.
+2. It outputs `{name}_normalized.html` into `source/`.
+3. Run `pipeline.py` as usual — Stage 1 finds the `<h2>` tags, Stage 2 splits cleanly.
+
+The only pipeline change worth considering (optional, not required): adding a `--from-epub` flag to `pipeline.py` that automatically invokes the preprocessor first, so you can do:
+
+```bash
+python pipeline.py --from-epub book.epub
+```
+
+instead of two separate commands. But this is sugar, not structure — the preprocessor remains its own module either way.
+
+---
+
+## Summary of Outputs
+
+| Output | Purpose |
+|--------|---------|
+| `{name}_normalized.html` | Clean, flat HTML with unique h2 headings — direct input for pipeline |
+| `{name}_manifest.json` | Record of structural decisions for reproducibility |
+| Console audit report | Hierarchy detection, word counts, warnings — for user review |
