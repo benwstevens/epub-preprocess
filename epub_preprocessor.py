@@ -682,19 +682,34 @@ def run_structural_audit(
         print("  WARNING: No TOC entries found in this EPUB.")
         print("  Will fall back to heading-tag analysis.")
 
-    # 2. Count spine items
+    # 2. Count spine items and classify front/back matter
     spine_items = get_spine_items(book)
-    print(f"\n--- Spine: {len(spine_items)} content files ---")
+    classification = classify_spine_items(spine_items, flat_toc)
+    front_count = sum(1 for v in classification.values() if v == "front")
+    back_count = sum(1 for v in classification.values() if v == "back")
+    content_count = sum(1 for v in classification.values() if v == "content")
+    print(f"\n--- Spine: {len(spine_items)} files ---")
+    print(f"  Front matter: {front_count}, Content: {content_count}, Back matter: {back_count}")
 
     # 3. Parse content files
     docs = parse_content_files(book)
 
-    # 3b. Promote styled divs/paragraphs to semantic heading tags
-    promote_styled_headings(docs, heading_map=heading_map)
+    # Build skip set: front/back matter + TOC-like pages not targeted by TOC
+    toc_target_fnames = {e.base_href.split("/")[-1] for e in flat_toc if e.base_href}
+    skip_hrefs: set[str] = set()
+    for href in docs:
+        fname = href.split("/")[-1]
+        if classification.get(href) in ("front", "back"):
+            skip_hrefs.add(href)
+        elif "toc" in fname.lower() and fname not in toc_target_fnames:
+            skip_hrefs.add(href)
 
-    # 4. Scan headings
-    heading_data = scan_headings(docs)
-    print(f"\n--- Heading Tag Survey ---")
+    # 3b. Promote styled divs/paragraphs to semantic heading tags
+    promote_styled_headings(docs, heading_map=heading_map, skip_hrefs=skip_hrefs)
+
+    # 4. Scan headings (content files only)
+    heading_data = scan_headings(docs, skip_hrefs=skip_hrefs)
+    print(f"\n--- Heading Tag Survey (content files only) ---")
     if heading_data:
         for tag in sorted(heading_data.keys(), key=lambda t: int(t[1])):
             entries = heading_data[tag]
@@ -707,7 +722,7 @@ def run_structural_audit(
         print("  WARNING: No heading tags (h1-h6) found.")
 
     # 5. Detect non-standard headings
-    non_standard = detect_non_standard_headings(docs)
+    non_standard = detect_non_standard_headings(docs, skip_hrefs=skip_hrefs)
     if non_standard:
         print(f"\n--- Non-Standard Heading Markup ({len(non_standard)} found) ---")
         for selector, text, href in non_standard[:10]:
@@ -752,6 +767,8 @@ def run_structural_audit(
         "toc_tree": toc_tree,
         "flat_toc": flat_toc,
         "spine_items": spine_items,
+        "classification": classification,
+        "skip_hrefs": skip_hrefs,
         "docs": docs,
         "heading_data": heading_data,
         "non_standard": non_standard,
