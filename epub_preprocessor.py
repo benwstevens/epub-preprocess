@@ -170,6 +170,65 @@ def get_spine_items(book: ep.EpubBook) -> list[tuple[str, str]]:
     return items
 
 
+def classify_spine_items(
+    spine_items: list[tuple[str, str]],
+    flat_toc: list[TOCEntry],
+) -> dict[str, str]:
+    """Classify each spine item as 'front', 'content', or 'back' matter.
+
+    Uses the TOC to find which files are referenced by Part/Section/Chapter
+    entries. Everything before the first such file is front matter; everything
+    after the last is back matter.
+    """
+    content_pattern = re.compile(
+        r"^(part|section|chapter|book|act)\b", re.IGNORECASE
+    )
+
+    # Collect hrefs from TOC entries whose titles look like content
+    content_hrefs: set[str] = set()
+    for entry in flat_toc:
+        if not entry.base_href:
+            continue
+        if content_pattern.search(entry.title):
+            content_hrefs.add(entry.base_href)
+        # If a parent is content-like, include its children
+        for child in entry.flatten()[1:]:
+            if child.base_href and content_pattern.search(entry.title):
+                content_hrefs.add(child.base_href)
+
+    # Fallback: if no content-like titles, use all TOC hrefs
+    if not content_hrefs:
+        content_hrefs = {e.base_href for e in flat_toc if e.base_href}
+
+    # Normalize to filenames for matching
+    content_fnames = {h.split("/")[-1] for h in content_hrefs}
+
+    spine_hrefs = [href for _id, href in spine_items]
+    first_content = None
+    last_content = None
+    for i, href in enumerate(spine_hrefs):
+        if href.split("/")[-1] in content_fnames:
+            if first_content is None:
+                first_content = i
+            last_content = i
+
+    result: dict[str, str] = {}
+    if first_content is None:
+        for href in spine_hrefs:
+            result[href] = "content"
+        return result
+
+    for i, href in enumerate(spine_hrefs):
+        if i < first_content:
+            result[href] = "front"
+        elif i > last_content:
+            result[href] = "back"
+        else:
+            result[href] = "content"
+
+    return result
+
+
 def parse_content_files(book: ep.EpubBook) -> OrderedDict:
     """Parse all content documents and return {href: BeautifulSoup} in spine order.
 
@@ -196,13 +255,19 @@ def parse_content_files(book: ep.EpubBook) -> OrderedDict:
     return docs
 
 
-def scan_headings(docs: OrderedDict) -> dict[str, list[tuple[str, str]]]:
+def scan_headings(
+    docs: OrderedDict,
+    skip_hrefs: set[str] | None = None,
+) -> dict[str, list[tuple[str, str]]]:
     """Scan all heading tags across content files.
 
     Returns {tag_name: [(text, source_href), ...]}.
+    skip_hrefs: files to exclude (e.g. front/back matter, TOC page).
     """
     headings: dict[str, list[tuple[str, str]]] = {}
     for href, (soup, _body_html) in docs.items():
+        if skip_hrefs and href in skip_hrefs:
+            continue
         for level in range(1, 7):
             tag = f"h{level}"
             for el in soup.find_all(tag):
@@ -212,7 +277,10 @@ def scan_headings(docs: OrderedDict) -> dict[str, list[tuple[str, str]]]:
     return headings
 
 
-def detect_non_standard_headings(docs: OrderedDict) -> list[tuple[str, str, str]]:
+def detect_non_standard_headings(
+    docs: OrderedDict,
+    skip_hrefs: set[str] | None = None,
+) -> list[tuple[str, str, str]]:
     """Detect potential non-standard heading markup (styled <p> or <div> elements).
 
     Returns [(css_selector, text, source_href), ...] for likely chapter titles
@@ -225,6 +293,8 @@ def detect_non_standard_headings(docs: OrderedDict) -> list[tuple[str, str, str]
     )
     results = []
     for href, (soup, _body_html) in docs.items():
+        if skip_hrefs and href in skip_hrefs:
+            continue
         for p in soup.find_all(["p", "div", "span"]):
             cls = p.get("class", [])
             text = p.get_text(strip=True)
@@ -248,26 +318,14 @@ def detect_non_standard_headings(docs: OrderedDict) -> list[tuple[str, str, str]
 def promote_styled_headings(
     docs: OrderedDict,
     heading_map: dict[str, str] | None = None,
+    skip_hrefs: set[str] | None = None,
 ) -> int:
     """Promote div/p/span elements with known CSS classes to semantic heading tags.
-
-    Many EPUBs (especially those converted from InDesign or Word) use styled
-    ``<div>`` or ``<p>`` elements with class names like ``cpt``, ``ct``, ``cst``
-    instead of ``<h1>``–``<h6>``.  This function rewrites those elements in-place
-    so that the rest of the pipeline (scan_headings, build_chapter_candidates,
-    etc.) can work with standard heading tags.
-
-    When the promoted heading levels would collide with heading tags that already
-    exist in the HTML, existing headings are **demoted** (shifted down) to make
-    room.  For example, if ``div.cpt`` is promoted to ``<h1>`` and the document
-    already contains ``<h1>`` chapter headings, those existing ``<h1>`` tags are
-    shifted to ``<h3>`` (or lower) so the hierarchy stays clean.
 
     Args:
         docs: OrderedDict from ``parse_content_files()`` — mutated in place.
         heading_map: Optional custom mapping of CSS class → heading tag.
-            Example: ``{"mypart": "h1", "mychap": "h2"}``.
-            When *None*, the built-in default map is used.
+        skip_hrefs: Files to skip (e.g. TOC page, front/back matter).
 
     Returns:
         The total number of elements promoted across all documents.
@@ -276,15 +334,12 @@ def promote_styled_headings(
     # Default class → heading-tag mapping
     # ------------------------------------------------------------------
     default_map: dict[str, str] = {
-        # Common InDesign / EPUB-converter class conventions.
-        # NOTE: "ct" (compact title) and "cst" (compact subtitle) are
-        #   intentionally omitted — they are typically redundant short
-        #   labels that duplicate the cpt/cct heading text and create
-        #   noise if promoted.  Use --heading-map to add them back for
-        #   EPUBs where they serve as the primary chapter headings.
+        # InDesign / EPUB-converter class conventions.
         "cpt": "h1",   # Chapter Part Title  (e.g. "Part One")
         "cct": "h2",   # Chapter Category/Group Title (e.g. "Section I")
-        # Broader patterns often seen in various EPUB producers
+        "ct":  "h3",   # Compact title (e.g. "CHAPTER I." or "SECTION I.")
+        "cst": "h4",   # Compact subtitle (e.g. "Of Sympathy.")
+        # Broader patterns
         "part-title":    "h1",
         "parttitle":     "h1",
         "book-title":    "h1",
@@ -308,6 +363,8 @@ def promote_styled_headings(
     existing_levels: set[int] = set()    # levels already present as h-tags
 
     for href, (soup, _body_html) in docs.items():
+        if skip_hrefs and href in skip_hrefs:
+            continue
         # Check existing heading tags
         for level in range(1, 7):
             if soup.find(f"h{level}"):
@@ -357,6 +414,8 @@ def promote_styled_headings(
         # Demote existing headings in every document (high levels first to
         # avoid collisions within the same pass).
         for href, (soup, _body_html) in list(docs.items()):
+            if skip_hrefs and href in skip_hrefs:
+                continue
             changed = False
             for old_level in sorted(existing_levels, reverse=True):
                 new_level = min(old_level + shift, 6)
@@ -382,6 +441,8 @@ def promote_styled_headings(
     promotion_summary: dict[str, list[str]] = {}
 
     for href, (soup, _body_html) in list(docs.items()):
+        if skip_hrefs and href in skip_hrefs:
+            continue
         promoted_in_file = 0
 
         for el in soup.find_all(["div", "p", "span"]):
