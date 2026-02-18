@@ -1,6 +1,6 @@
 # EPUB Preprocessor — Fix Plan
 
-## Status: IN PROGRESS — Leviathan fixes needed
+## Status: COMPLETE — Both EPUBs working correctly
 
 ---
 
@@ -232,6 +232,37 @@ like "Part I. OF MAN, Ch I. OF SENSE", with word counts in the 2K–15K range.
 
 ### Implementation steps for Leviathan fixes
 
-- [ ] Step 8: Add smart chapter-depth detection to `build_chapter_candidates`
-- [ ] Step 9: Add fragment-aware content splitting for same-file TOC entries
-- [ ] Step 10: Test on both `leviathan.epub` and `theoryofmoralsentiment.epub` (regression check)
+- [x] Step 8: Add smart chapter-depth detection to `build_chapter_candidates`
+- [x] Step 9: Add fragment-aware content splitting for same-file TOC entries
+- [x] Step 10: Test on both `leviathan.epub` and `theoryofmoralsentiment.epub` (regression check)
+
+---
+
+## 6. Test Results After Leviathan Fixes
+
+### `leviathan.epub` — After fixes
+```
+52 chapters, 194,158 words
+- Correct chapter-depth detection (depth 0 = chapters, not depth 1 = sub-topics)
+- THE INTRODUCTION included (Hobbes's own intro, not editorial)
+- A REVIEW, AND CONCLUSION included
+- Title page ("LEVIATHAN"), date ("1651"), and Gutenberg license filtered
+- 4 Part title pages flagged as tiny (correct — they're structural markers)
+- No mega-chapters, no content duplication
+- 4 warnings (Part title pages, expected)
+```
+
+### `theoryofmoralsentiment.epub` — Regression check
+```
+54 chapters, 150,673 words (unchanged from previous fix)
+- Editorial introduction (Amartya Sen) correctly excluded
+- All Part/Section/Chapter hierarchy intact
+- 0 warnings
+```
+
+### Key changes made for Leviathan
+1. `_detect_chapter_depth()` — scans TOC for "CHAPTER" entries at each depth; uses that depth instead of blind max
+2. `_split_at_fragment()` — extracts content between fragment anchors when multiple TOC entries share a file
+3. Improved content filtering: title-pattern matching + classification tiebreaker (not classification-only)
+4. Added `book_title` to audit dict for title-page filtering
+5. Non-content regex updated: catches "license" anywhere in title, year-only entries (e.g. "1651")
