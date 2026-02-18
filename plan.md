@@ -1,6 +1,6 @@
 # EPUB Preprocessor — Fix Plan
 
-## Status: COMPLETE
+## Status: IN PROGRESS — Leviathan fixes needed
 
 ---
 
@@ -173,3 +173,65 @@ Within those, some files contain multiple sub-chapters:
    - Ancestor tracking from TOC tree (not from heading position)
    - Sub-splitting via `_find_sub_chapter_tag()` and `_split_file_at_headings()`
 5. `_strip_leading_heading()` handles TOC-derived chapters and subtitle stripping
+
+---
+
+## 5. Diagnosis from testing `leviathan.epub`
+
+Running the fixed script on Leviathan produces **669 chapters** and **3,744,736 words**.
+Leviathan has ~47 chapters and ~200K words. Two separate bugs:
+
+### Bug G: Wrong split depth — sub-topics treated as chapters
+
+Leviathan's TOC structure:
+```
+[d0] LEVIATHAN                     (title)
+[d0] Contents                      (front matter)
+[d0] THE INTRODUCTION              (chapter, no children)
+[d0] PART I. OF MAN                (part label)
+[d0] CHAPTER I. OF SENSE           (chapter, has children)
+  [d1] Memory                      (sub-topic within chapter)
+  [d1] Dreams                      (sub-topic within chapter)
+  [d1] Apparitions Or Visions      (sub-topic within chapter)
+[d0] CHAPTER II. OF IMAGINATION    (chapter, has children)
+  [d1] ...more sub-topics...
+...                                (~47 chapters at depth 0, ~670 sub-topics at depth 1)
+```
+
+The script picks `target_depth = max_toc_depth = 1`, collecting all **670 sub-topic
+entries** as chapters instead of the **~47 actual chapters** at depth 0.
+
+Compare with Moral Sentiments:
+- **Moral Sentiments**: Parts at d0, Sections/Chapters at d1 → d1 is correct split
+- **Leviathan**: Parts AND Chapters at d0, sub-topics at d1 → d0 is correct split
+
+**Root cause**: `build_chapter_candidates` blindly uses `max_toc_depth` as the target.
+It needs to detect which depth contains chapter-level entries (entries whose titles
+start with "CHAPTER") and use that as the split level.
+
+### Bug H: Content duplication — multiple TOC entries point to same file
+
+Many depth-1 sub-topic entries point to the same file with different fragment anchors
+(e.g., `chapter01.xhtml#memory`, `chapter01.xhtml#dreams`). The script gives each
+entry the **full file's content** instead of splitting at fragment boundaries.
+This causes massive duplication: ~200K words × ~3-4x = ~670K+ words (inflated further
+by the ~670 entries each getting full-file content → 3.7M words).
+
+### Fixes needed
+
+| Fix | What | Why |
+|-----|------|-----|
+| F7 | Smart chapter-depth detection | Look for the TOC depth where "CHAPTER" entries live; use that instead of max depth |
+| F8 | Fragment-aware content splitting | When multiple TOC entries share a file, split at fragment anchor boundaries instead of duplicating the whole file |
+
+### Expected output for `leviathan.epub`
+
+Leviathan has 4 Parts and ~47 Chapters (CHAPTER I through XLVII) plus an Introduction
+and a "Review and Conclusion". The correct output should be ~49 chapters with labels
+like "Part I. OF MAN, Ch I. OF SENSE", with word counts in the 2K–15K range.
+
+### Implementation steps for Leviathan fixes
+
+- [ ] Step 8: Add smart chapter-depth detection to `build_chapter_candidates`
+- [ ] Step 9: Add fragment-aware content splitting for same-file TOC entries
+- [ ] Step 10: Test on both `leviathan.epub` and `theoryofmoralsentiment.epub` (regression check)
