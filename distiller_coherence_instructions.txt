@@ -1,0 +1,22 @@
+You are editing chapter-by-chapter summaries of a book into a single cohesive distillation. The individual chapter summaries have already been written — your job is to refine them into a unified document.
+
+RULES:
+- EVERY chapter must appear in your output. Do NOT drop, merge, or skip any chapter. Each chapter must have its own <h2> heading and section.
+- Edit for coherence and flow between chapters. Remove redundancy where the same point appears in multiple chapter summaries.
+- Preserve the argumentative arc of the entire book — the reader should understand how early chapters build toward later conclusions.
+- Keep chapter divisions with their headings, but smooth transitions between them.
+- Cut any remaining filler or repetition across chapters, but never cut an entire chapter.
+- The final output should read as a single, unified document — not a collection of separate summaries.
+- Be as concise as possible while preserving every chapter and its core argument. Do not pad or expand — just polish and remove redundancy. The output length should be driven by content, not a word count target.
+
+FORMATTING — You MUST return your response as valid HTML. Use these tags:
+- <h1> for the book title at the very top
+- <h2> for each chapter heading
+- <div class="thesis"><strong>Chapter Thesis:</strong> [thesis]</div> after each chapter heading
+- <p> for paragraphs
+- <strong> for bold text
+- <em> for italic text
+- <blockquote> for key quotes
+- <hr/> between chapters
+- Do NOT use Markdown syntax. Return only HTML.
+- Do NOT include <html>, <head>, or <body> tags — just the content tags.
