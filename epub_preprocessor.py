@@ -783,202 +783,31 @@ def run_structural_audit(
 # Build chapter candidates from the EPUB structure
 # ============================================================================
 
-def build_chapter_candidates(
-    audit: dict,
-    split_level: str | None = None,
-) -> list[ChapterCandidate]:
-    """Build the list of chapter candidates based on audit results and split level.
+def _get_doc_for_href(docs: OrderedDict, target_href: str):
+    """Find a document in docs matching the given href."""
+    if target_href in docs:
+        return target_href, docs[target_href]
+    target_fname = target_href.split("/")[-1]
+    for href in docs:
+        if href.split("/")[-1] == target_fname:
+            return href, docs[href]
+    return None, None
 
-    Handles edge cases: single-file EPUBs, multi-file chapters, no TOC, etc.
-    """
-    hierarchy = audit["hierarchy"]
-    heading_data = audit["heading_data"]
-    docs = audit["docs"]
-    toc_tree = audit["toc_tree"]
-    flat_toc = audit["flat_toc"]
 
-    # Determine which tag to split on
-    if split_level and hierarchy:
-        # User-specified split level (e.g., "section", "part", "chapter")
-        split_tag = None
-        for tag, role in hierarchy.items():
-            if role == split_level:
-                split_tag = tag
-                break
-        if not split_tag:
-            print(f"WARNING: Split level '{split_level}' not found in hierarchy.")
-            print(f"  Available levels: {', '.join(hierarchy.values())}")
-            print(f"  Falling back to default split tag.")
-            split_tag = audit["split_tag"]
-    else:
-        split_tag = audit["split_tag"]
-
-    if not split_tag:
-        # Last resort: pick the heading tag with the most occurrences
-        if heading_data:
-            split_tag = max(heading_data.keys(), key=lambda t: len(heading_data[t]))
-            print(f"  Using most frequent heading tag: <{split_tag}>")
-        else:
-            print("ERROR: No heading tags found. Cannot build chapter list.")
-            sys.exit(1)
-
-    # Determine parent hierarchy tags (tags that represent levels above the split)
-    parent_tags = []
-    if hierarchy:
-        role_order = ["part", "section", "chapter", "subsection"]
-        split_role = hierarchy.get(split_tag, "chapter")
-        split_idx = role_order.index(split_role) if split_role in role_order else len(role_order)
-        for tag, role in sorted(hierarchy.items(), key=lambda x: int(x[0][1])):
-            if role in role_order:
-                role_idx = role_order.index(role)
-                if role_idx < split_idx:
-                    parent_tags.append((tag, role))
-
-    # Build concatenated HTML from all content documents in spine order
-    all_html_parts = []
-    file_boundaries = []  # (start_pos, href)
-    current_pos = 0
-    for href, (soup, body_html) in docs.items():
-        file_boundaries.append((current_pos, href))
-        all_html_parts.append(body_html)
-        current_pos += len(body_html)
-
-    full_html_raw = "".join(all_html_parts)
-    full_soup = BeautifulSoup(full_html_raw, "lxml")
-
-    # Re-serialize from the parsed soup so that str(el) is guaranteed to
-    # match substrings of full_html (avoids serialization mismatches).
-    body_tag = full_soup.find("body")
-    if body_tag:
-        full_html = "".join(str(c) for c in body_tag.children)
-    else:
-        full_html = str(full_soup)
-
-    # Recompute file boundaries against the re-serialized HTML.
-    # (Approximate: walk docs in order and find their first heading or
-    # a unique text snippet to anchor the boundary.)
-    file_boundaries = []
-    boundary_offset = 0
-    for href, (_soup, body_html) in docs.items():
-        file_boundaries.append((boundary_offset, href))
-        # Advance by the approximate length; exact match isn't critical
-        # since this is only used for source_file metadata.
-        boundary_offset += len(body_html)
-
-    # Find all split-level headings and parent headings.
-    # Use progressive search offset so duplicate headings are matched in
-    # document order instead of all resolving to the first occurrence.
-    all_headings = []
-    search_offset = 0
-    for el in full_soup.find_all(re.compile(r"^h[1-6]$")):
-        tag_name = el.name
-        text = el.get_text(strip=True)
-        if not text:
-            continue
-        el_str = str(el)
-        pos = full_html.find(el_str, search_offset)
-        if pos < 0:
-            # Try finding by text content from current offset
-            pos = full_html.find(text, search_offset)
-        if pos < 0:
-            # Last resort: search from beginning (shouldn't normally happen)
-            pos = full_html.find(el_str)
-            if pos < 0:
-                pos = full_html.find(text)
-        if pos >= 0:
-            search_offset = pos + 1
-        all_headings.append((pos, tag_name, text, el_str))
-
-    # all_headings is already in document order from find_all(); the sort
-    # is kept as a safety net but should be a no-op.
-    all_headings.sort(key=lambda x: x[0])
-
-    # Build chapter candidates by tracking parent context
-    candidates = []
-    parent_context: dict[str, str] = {}  # role -> current label
-    chapter_idx = 0
-
-    parent_tag_names = {tag for tag, _role in parent_tags}
-
-    for i, (pos, tag_name, text, el_str) in enumerate(all_headings):
-        if tag_name in parent_tag_names:
-            # Update parent context
-            role = hierarchy.get(tag_name, "")
-            parent_context[role] = text
-            # Clear deeper levels when a higher level changes
-            role_order = ["part", "section", "chapter", "subsection"]
-            if role in role_order:
-                role_idx = role_order.index(role)
-                for r in role_order[role_idx + 1:]:
-                    parent_context.pop(r, None)
-
-        if tag_name == split_tag:
-            chapter_idx += 1
-
-            # Build hierarchy label
-            hierarchy_parts = []
-            role_order = ["part", "section", "chapter", "subsection"]
-            for role in role_order:
-                if role in parent_context:
-                    # Abbreviate: "Part I: Title" stays, "Section II" -> "Sec II"
-                    val = parent_context[role]
-                    hierarchy_parts.append(_abbreviate_label(val, role))
-
-            # Add the current chapter heading
-            hierarchy_parts.append(text)
-
-            # Determine content: from this heading to the next split-level heading
-            # (or next parent heading, or end of document)
-            start_pos = pos
-            end_pos = len(full_html)
-            for j in range(i + 1, len(all_headings)):
-                next_pos, next_tag, _next_text, _next_str = all_headings[j]
-                if next_tag == split_tag or next_tag in parent_tag_names:
-                    end_pos = next_pos
-                    break
-
-            content_html = full_html[start_pos:end_pos]
-
-            # Find the source file
-            source_file = ""
-            for boundary_pos, href in reversed(file_boundaries):
-                if pos >= boundary_pos:
-                    source_file = href
-                    break
-
-            # Build descriptive label
-            if len(hierarchy_parts) > 1:
-                label = ", ".join(hierarchy_parts[:-1]) + " — " + hierarchy_parts[-1]
-            else:
-                label = hierarchy_parts[0]
-
-            # Find matching TOC entry
-            toc_match = None
-            for entry in flat_toc:
-                if _text_match(entry.title, text):
-                    toc_match = entry
-                    break
-
-            candidates.append(ChapterCandidate(
-                index=chapter_idx,
-                label=label,
-                hierarchy_parts=hierarchy_parts,
-                heading_tag=split_tag,
-                html_content=content_html,
-                source_file=source_file,
-                toc_entry=toc_match,
-            ))
-
-    if not candidates:
-        print(f"WARNING: No chapters found using <{split_tag}> as split tag.")
-        print("  Trying to build chapters from TOC entries directly...")
-        candidates = _build_from_toc_fallback(audit)
-
-    return candidates
+def _guess_role(text: str) -> str:
+    """Guess whether a heading is a part, section, or chapter from its text."""
+    if re.match(r"^part\b", text, re.IGNORECASE):
+        return "part"
+    if re.match(r"^section\b", text, re.IGNORECASE):
+        return "section"
+    if re.match(r"^(chapter|ch\.?\s)\b", text, re.IGNORECASE):
+        return "chapter"
+    return ""
 
 
 def _abbreviate_label(text: str, role: str) -> str:
-    """Abbreviate hierarchy labels for display. E.g., 'Section II' -> 'Sec II'."""
+    """Abbreviate hierarchy labels for display. E.g., 'Section II' -> 'Sec II'.
+    Also strips subtitle after dash for Part/Section labels."""
     abbreviations = {
         "part": (r"(?i)^part\b", "Part"),
         "section": (r"(?i)^section\b", "Sec"),
@@ -987,44 +816,260 @@ def _abbreviate_label(text: str, role: str) -> str:
     if role in abbreviations:
         pattern, replacement = abbreviations[role]
         if re.match(pattern, text):
-            return re.sub(pattern, replacement, text, count=1)
+            text = re.sub(pattern, replacement, text, count=1)
+    # Strip " - SUBTITLE" from Part/Section labels for brevity
+    stripped = re.sub(r"\s*[-—]+\s+.*$", "", text)
+    if stripped != text and role in ("part", "section"):
+        return stripped
     return text
 
 
-def _build_from_toc_fallback(audit: dict) -> list[ChapterCandidate]:
-    """Fallback: build chapter candidates directly from TOC when heading-based
-    splitting finds nothing."""
+def _find_sub_chapter_tag(soup) -> str | None:
+    """Detect the heading tag used for sub-chapters within a file.
+
+    Looks for h-tags where text starts with 'CHAPTER' or 'INTRODUCTION',
+    suggesting sub-chapter divisions. Requires at least 2 matches.
+    """
+    chapter_re = re.compile(r"^(chapter|introduction|conclusion)\b", re.IGNORECASE)
+    body = soup.find("body")
+    if not body:
+        return None
+    tag_counts: Counter = Counter()
+    for level in range(1, 7):
+        tag = f"h{level}"
+        for el in body.find_all(tag):
+            text = el.get_text(strip=True)
+            if text and chapter_re.match(text):
+                tag_counts[tag] += 1
+    if not tag_counts:
+        return None
+    best_tag = max(tag_counts.keys(), key=lambda t: (tag_counts[t], -int(t[1])))
+    if tag_counts[best_tag] >= 2:
+        return best_tag
+    return None
+
+
+def _get_subtitle_after_heading(soup, heading_tag: str, heading_text: str) -> str:
+    """Find the subtitle element that immediately follows a chapter heading.
+
+    E.g. <h5>CHAPTER I.</h5> <h6>Of Sympathy.</h6> -> returns "Of Sympathy."
+    """
+    h_level = int(heading_tag[1])
+    subtitle_tag = f"h{h_level + 1}"
+    for el in soup.find_all(heading_tag):
+        if el.get_text(strip=True) == heading_text:
+            sibling = el.find_next_sibling()
+            if sibling and sibling.name == subtitle_tag:
+                return sibling.get_text(strip=True)
+            break
+    return ""
+
+
+def _split_file_at_headings(
+    soup,
+    body_html: str,
+    heading_tag: str,
+) -> list[tuple[str, str, str]]:
+    """Split a file's body content at heading-tag boundaries.
+
+    Returns list of (tag_name, heading_text, chunk_html).
+    First chunk may have empty heading_text if there's pre-heading content.
+    """
+    body = soup.find("body")
+    if not body:
+        return [("", "", body_html)]
+
+    chunks: list[tuple[str, str, str]] = []
+    current_parts: list[str] = []
+    current_tag = ""
+    current_text = ""
+
+    for child in body.children:
+        if isinstance(child, NavigableString):
+            current_parts.append(str(child))
+            continue
+        if getattr(child, "name", None) == heading_tag:
+            # Save previous chunk
+            if current_parts:
+                chunks.append((current_tag, current_text, "".join(current_parts)))
+            current_tag = heading_tag
+            current_text = child.get_text(strip=True)
+            current_parts = [str(child)]
+        else:
+            current_parts.append(str(child))
+
+    if current_parts:
+        chunks.append((current_tag, current_text, "".join(current_parts)))
+
+    return chunks
+
+
+def build_chapter_candidates(
+    audit: dict,
+    split_level: str | None = None,
+) -> list[ChapterCandidate]:
+    """Build the list of chapter candidates using a TOC-driven approach.
+
+    Instead of concatenating all HTML and splitting on a single heading tag,
+    this processes each TOC entry's file individually:
+    1. Walk the TOC tree for structure.
+    2. Map each entry to its content file.
+    3. For multi-chapter files, split at internal heading boundaries.
+    4. Build labels from TOC hierarchy context.
+    """
+    toc_tree = audit["toc_tree"]
     flat_toc = audit["flat_toc"]
     docs = audit["docs"]
+    classification = audit.get("classification", {})
 
-    if not flat_toc:
-        return []
+    # Determine target TOC depth
+    toc_depths = {e.depth for e in flat_toc if e.base_href}
+    max_toc_depth = max(toc_depths) if toc_depths else 0
 
+    do_sub_split = True
+    if split_level == "part":
+        target_depth = 0
+        do_sub_split = False
+    elif split_level == "section":
+        target_depth = min(1, max_toc_depth)
+        do_sub_split = False
+    else:
+        target_depth = max_toc_depth
+
+    # Build ancestor map: id(entry) -> [ancestor title strings]
+    entry_ancestors: dict[int, list[str]] = {}
+
+    def _walk_toc(entries: list[TOCEntry], ancestors: list[str]):
+        for entry in entries:
+            entry_ancestors[id(entry)] = list(ancestors)
+            if entry.children:
+                _walk_toc(entry.children, ancestors + [entry.title])
+
+    _walk_toc(toc_tree, [])
+
+    # Get leaf entries at target depth
+    leaf_entries: list[TOCEntry] = []
+    for e in flat_toc:
+        if e.depth == target_depth and e.base_href:
+            leaf_entries.append(e)
+    # Also include shallower entries that have no deeper children
+    for e in flat_toc:
+        if e.depth < target_depth and e.base_href:
+            has_deeper = any(
+                c.depth >= target_depth and c.base_href
+                for c in e.flatten()[1:]
+            )
+            if not has_deeper:
+                leaf_entries.append(e)
+
+    # Sort by TOC order
+    flat_order = {id(e): i for i, e in enumerate(flat_toc)}
+    leaf_entries.sort(key=lambda e: flat_order.get(id(e), 999))
+
+    # Filter out front/back matter entries
+    back_matter_re = re.compile(
+        r"^(teaser|biographical|textual|notes|index|copyright|title\s*page|"
+        r"colophon|acknowledgment|about\s*the|also\s*by|further\s*reading|"
+        r"bibliography|glossary|next)",
+        re.IGNORECASE,
+    )
+    content_entries = []
+    for entry in leaf_entries:
+        if back_matter_re.search(entry.title):
+            continue
+        doc_href, _ = _get_doc_for_href(docs, entry.base_href)
+        if doc_href and classification.get(doc_href) in ("front", "back"):
+            continue
+        content_entries.append(entry)
+
+    if not content_entries:
+        content_entries = leaf_entries
+
+    # Build candidates
     candidates = []
-    for idx, entry in enumerate(flat_toc, 1):
-        if not entry.base_href:
+    chapter_idx = 0
+
+    for entry in content_entries:
+        doc_href, doc_data = _get_doc_for_href(docs, entry.base_href)
+        if doc_data is None:
             continue
+        soup, body_html = doc_data
+        ancestors = entry_ancestors.get(id(entry), [])
 
-        # Find matching document
-        doc_key = None
-        for href in docs:
-            if href == entry.base_href or href.split("/")[-1] == entry.base_href.split("/")[-1]:
-                doc_key = href
-                break
+        # Build abbreviated ancestor labels
+        ancestor_labels = [
+            _abbreviate_label(a, _guess_role(a)) for a in ancestors
+        ]
 
-        if doc_key is None:
-            continue
+        # Check for sub-chapters in this file
+        sub_tag = _find_sub_chapter_tag(soup) if do_sub_split else None
 
-        _soup, body_html = docs[doc_key]
-        candidates.append(ChapterCandidate(
-            index=idx,
-            label=entry.title,
-            hierarchy_parts=[entry.title],
-            heading_tag="toc",
-            html_content=body_html,
-            source_file=doc_key,
-            toc_entry=entry,
-        ))
+        if sub_tag:
+            chunks = _split_file_at_headings(soup, body_html, sub_tag)
+            for chunk_tag, chunk_heading, chunk_html in chunks:
+                # Skip tiny pre-heading content (section title pages)
+                if not chunk_tag:
+                    wc = len(re.sub(r"<[^>]+>", " ", chunk_html).split())
+                    if wc < 50:
+                        continue
+
+                chapter_idx += 1
+                parts = list(ancestor_labels)
+                parts.append(_abbreviate_label(entry.title, _guess_role(entry.title)))
+
+                if chunk_heading:
+                    subtitle = _get_subtitle_after_heading(soup, sub_tag, chunk_heading)
+                    if subtitle:
+                        parts.append(f"{chunk_heading} — {subtitle}")
+                    else:
+                        parts.append(chunk_heading)
+
+                candidates.append(ChapterCandidate(
+                    index=chapter_idx,
+                    label=", ".join(parts),
+                    hierarchy_parts=parts,
+                    heading_tag=sub_tag,
+                    html_content=chunk_html,
+                    source_file=doc_href or "",
+                    toc_entry=entry,
+                ))
+        else:
+            # Single chapter from this file
+            chapter_idx += 1
+            parts = list(ancestor_labels)
+            parts.append(_abbreviate_label(entry.title, _guess_role(entry.title)))
+
+            candidates.append(ChapterCandidate(
+                index=chapter_idx,
+                label=", ".join(parts),
+                hierarchy_parts=parts,
+                heading_tag="toc",
+                html_content=body_html,
+                source_file=doc_href or "",
+                toc_entry=entry,
+            ))
+
+    if not candidates:
+        print("WARNING: No chapters found via TOC. Falling back to heading scan.")
+        # Simple fallback: use heading tags directly
+        skip_hrefs = audit.get("skip_hrefs", set())
+        split_tag = audit.get("split_tag")
+        if split_tag:
+            for href, (s, bh) in docs.items():
+                if href in skip_hrefs:
+                    continue
+                body = s.find("body")
+                if not body:
+                    continue
+                for el in body.find_all(split_tag):
+                    text = el.get_text(strip=True)
+                    if text:
+                        chapter_idx += 1
+                        candidates.append(ChapterCandidate(
+                            index=chapter_idx, label=text,
+                            hierarchy_parts=[text], heading_tag=split_tag,
+                            html_content=str(el), source_file=href,
+                        ))
 
     return candidates
 
@@ -1271,14 +1316,47 @@ def _escape_html(text: str) -> str:
 
 
 def _strip_leading_heading(html: str, tag_name: str) -> str:
-    """Remove the first heading tag from the HTML content to avoid duplication
+    """Remove leading heading tags from the HTML content to avoid duplication
     with the normalized <h2> we insert."""
-    # Match the first occurrence of the heading tag (including nested content)
+    if not tag_name or tag_name == "toc":
+        # For TOC-derived chapters, strip all leading heading-like elements
+        # (h-tags and known heading divs like ct, cst, cpt, cct, ctag1)
+        stripped = html
+        for _ in range(8):
+            m = re.match(
+                r"\s*<(h[1-6])\b[^>]*>.*?</\1>",
+                stripped,
+                re.DOTALL | re.IGNORECASE,
+            )
+            if m:
+                stripped = stripped[m.end():]
+                continue
+            m = re.match(
+                r'\s*<(div|p)\s+class="(ct|cst|cpt|cct|ctag1)[^"]*"[^>]*>.*?</\1>',
+                stripped,
+                re.DOTALL | re.IGNORECASE,
+            )
+            if m:
+                stripped = stripped[m.end():]
+                continue
+            break
+        return stripped
+
+    # For heading-tag splits, strip the specific heading and its subtitle
     pattern = re.compile(
         rf"^\s*<{re.escape(tag_name)}[^>]*>.*?</{re.escape(tag_name)}>",
         re.DOTALL | re.IGNORECASE,
     )
-    return pattern.sub("", html, count=1)
+    result = pattern.sub("", html, count=1)
+    # Also strip a subtitle heading (one level lower) if it immediately follows
+    h_level = int(tag_name[1])
+    subtitle_tag = f"h{h_level + 1}"
+    subtitle_pattern = re.compile(
+        rf"^\s*<{re.escape(subtitle_tag)}[^>]*>.*?</{re.escape(subtitle_tag)}>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    result = subtitle_pattern.sub("", result, count=1)
+    return result
 
 
 # ============================================================================
