@@ -1,3 +1,7 @@
 # Generated output files
 *_normalized.html
 *_manifest.json
+
+# Runtime artifacts
+__pycache__/
+books/
