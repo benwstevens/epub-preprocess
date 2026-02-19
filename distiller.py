@@ -361,7 +361,7 @@ hr { border: none; border-top: 1px solid #ccc; margin: 2em 0; }
 
 def main():
     parser = argparse.ArgumentParser(description="Ebook Distiller — Hierarchical Summarization")
-    parser.add_argument("book", help="Path to EPUB file or book slug")
+    parser.add_argument("book", help="Path to EPUB/HTML file or book slug")
     parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4, 5], default=1)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--target", type=int, default=10000, help="Target word count (default: 10000)")

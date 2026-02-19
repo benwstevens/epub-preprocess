@@ -26,8 +26,15 @@ HEADING_TAGS = ["h1", "h2", "h3", "h4"]
 # Book directory setup
 # ===========================================================================
 def setup_book_dir(epub_path: Path) -> dict[str, Path]:
-    """Create a per-book directory structure under books/ and return paths."""
-    book_slug = re.sub(r"[^\w\-]", "", epub_path.stem.replace(" ", "_")).lower()
+    """Create a per-book directory structure under books/ and return paths.
+
+    Accepts an .epub or .html source file.
+    """
+    stem = epub_path.stem
+    # Strip _normalized suffix so the slug matches the original book name
+    if stem.endswith("_normalized"):
+        stem = stem[: -len("_normalized")]
+    book_slug = re.sub(r"[^\w\-]", "", stem.replace(" ", "_")).lower()
     book_dir = BASE_DIR / "books" / book_slug
 
     paths = {
@@ -548,14 +555,13 @@ def wrap_response_html(response_text: str, chapter_path: Path, suffix: str) -> s
 
 
 def resolve_epub_path(epub_arg: str) -> Path:
-    """Resolve the EPUB path from a CLI argument.
+    """Resolve the book source path from a CLI argument.
 
-    If it's an existing file path, use it directly.
-    If it matches a book slug in books/, use that.
+    Accepts an .epub or .html file path, or a book slug.
     """
     # Direct file path
     p = Path(epub_arg)
-    if p.exists() and p.suffix.lower() == ".epub":
+    if p.exists() and p.suffix.lower() in (".epub", ".html", ".htm"):
         return p.resolve()
 
     # Check if it's a book slug (books/<slug>/source/*.epub)
@@ -572,8 +578,9 @@ def resolve_epub_path(epub_arg: str) -> Path:
         if epubs:
             return epubs[0]
 
-    print(f"ERROR: Could not find EPUB file: {epub_arg}")
+    print(f"ERROR: Could not find book file: {epub_arg}")
     print("\nUsage: python3 <script>.py <path-to-book.epub>")
+    print("   or: python3 <script>.py <path-to-book.html>")
     print("   or: python3 <script>.py <book-slug>")
     print("\nAvailable books:")
     books_dir = BASE_DIR / "books"
